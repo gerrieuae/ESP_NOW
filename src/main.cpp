@@ -90,35 +90,15 @@
  *  WiFi.scanNetworks() returns WIFI_SCAN_FAILED instantly. */
 #define WIFI_RADIO_SETTLE_MS    300U
 
-/** @brief Duration (ms) the LED stays on for each slave-count pulse. */
-#define LED_PULSE_ON_MS         250U
+/** @brief LED blink interval while no slave peers are active (ms). */
+#define LED_SCAN_BLINK_MS       1000U
 
-/** @brief Gap (ms) between consecutive pulses within one cycle. */
-#define LED_PULSE_GAP_MS        100U
-
-/** @brief Quiet period (ms) after the last pulse before the next cycle. */
-#define LED_CYCLE_GAP_MS       1000U
-
-/** @brief Duration (ms) of the alive heartbeat pulse when no slaves are active. */
-#define LED_HEARTBEAT_ON_MS      50U
-
-/** @brief Total period (ms) of one heartbeat cycle (on + off). */
-#define LED_HEARTBEAT_PERIOD_MS 1000U
+/** @brief LED blink interval when at least one slave peer is active (ms). */
+#define LED_CONN_BLINK_MS        250U
 
 // ============================================================================
 // Local type definitions (internal to this file)
 // ============================================================================
-
-/**
- * @brief Phases of the onboard LED indicator state machine.
- */
-typedef enum {
-    LED_PHASE_HEARTBEAT_ON,  /**< LED on for LED_HEARTBEAT_ON_MS (no-slave alive blink). */
-    LED_PHASE_HEARTBEAT_OFF, /**< LED off; waiting until next heartbeat period.          */
-    LED_PHASE_PULSE_ON,      /**< LED on for LED_PULSE_ON_MS (one slave-count pulse).    */
-    LED_PHASE_PULSE_GAP,     /**< LED off LED_PULSE_GAP_MS gap between consecutive pulses. */
-    LED_PHASE_CYCLE_GAP,     /**< LED off LED_CYCLE_GAP_MS after the full pulse sequence. */
-} led_phase_t;
 
 /**
  * @brief Item stored in the ring buffer between the ESP-NOW callback and loop().
@@ -215,24 +195,17 @@ static volatile uint8_t   rxHead = 0U;
 static volatile uint8_t   rxTail = 0U;
 
 // ---------------------------------------------------------------------------
-// LED state machine state
+// LED state
 // ---------------------------------------------------------------------------
 
-/** @brief Current phase of the LED indicator state machine. */
-static led_phase_t ledPhase       = LED_PHASE_HEARTBEAT_OFF;
-
-/** @brief millis() recorded when the current LED phase was entered. */
-static uint32_t    ledTimestampMs = 0U;
-
-/** @brief Number of 250 ms pulses remaining in the current slave-count cycle. */
-static uint8_t     ledPulsesLeft  = 0U;
+/** @brief millis() of the last onboard LED toggle. */
+static uint32_t    ledToggleMs = 0U;
 
 // ============================================================================
 // Forward declarations
 // ============================================================================
 
-static void     ledStartPulse       (uint8_t pulseCount);
-static void     ledProcess          (void);
+static void     updateLed           (void);
 static void     masterProcess       (void);
 static void     processRxQueue      (void);
 static void     handleDiscoverResp  (const uint8_t *srcMac, const espnow_packet_t *pkt);
@@ -721,110 +694,21 @@ static bool readSerialChoice(uint8_t *outChoice)
 // ============================================================================
 
 /**
- * @brief Arms the LED for a new slave-count pulse sequence.
+ * @brief Toggles the onboard LED at a rate that reflects slave connection state.
  *
- * Turns the LED on immediately and records the phase timestamp so that
- * ledProcess() can manage the on/gap/cycle-gap timing non-blockingly.
- *
- * @param[in] pulseCount  Number of 250 ms pulses to emit (= active slave count).
+ * Blinks at LED_SCAN_BLINK_MS while no active slave peers are known, and
+ * switches to the faster LED_CONN_BLINK_MS cadence once at least one slave
+ * is active.
  */
-static void ledStartPulse(uint8_t pulseCount)
+static void updateLed(void)
 {
-    ledPulsesLeft  = pulseCount;
-    ledTimestampMs = millis();
-    digitalWrite(LED_BUILTIN, HIGH);
-    ledPhase = LED_PHASE_PULSE_ON;
-}
-
-/**
- * @brief Non-blocking LED indicator state machine; call from every loop().
- *
- * Behaviour:
- *   - No active slaves: 50 ms heartbeat blink every 1 s (alive indication).
- *   - N active slaves:  N consecutive 250 ms pulses separated by 100 ms gaps,
- *                       followed by a 1 s quiet period before repeating.
- *
- * The active-slave count is re-sampled at every cycle boundary so that the
- * display adapts immediately when slaves join or leave.
- */
-static void ledProcess(void)
-{
-    uint32_t nowMs      = millis();
-    uint8_t  slaveCount = countActivePeers();
-
-    switch (ledPhase)
+    uint32_t nowMs    = millis();
+    uint32_t interval = (countActivePeers() > 0U) ? LED_CONN_BLINK_MS
+                                                   : LED_SCAN_BLINK_MS;
+    if ((nowMs - ledToggleMs) >= interval)
     {
-    /* ------------------------------------------------------------------ */
-    case LED_PHASE_HEARTBEAT_ON:
-        if ((nowMs - ledTimestampMs) >= LED_HEARTBEAT_ON_MS)
-        {
-            digitalWrite(LED_BUILTIN, LOW);
-            ledTimestampMs = nowMs;
-            ledPhase       = LED_PHASE_HEARTBEAT_OFF;
-        }
-        break;
-
-    /* ------------------------------------------------------------------ */
-    case LED_PHASE_HEARTBEAT_OFF:
-        if ((nowMs - ledTimestampMs) >= (LED_HEARTBEAT_PERIOD_MS - LED_HEARTBEAT_ON_MS))
-        {
-            if (slaveCount > 0U)
-            {
-                ledStartPulse(slaveCount);
-            }
-            else
-            {
-                digitalWrite(LED_BUILTIN, HIGH);
-                ledTimestampMs = nowMs;
-                ledPhase       = LED_PHASE_HEARTBEAT_ON;
-            }
-        }
-        break;
-
-    /* ------------------------------------------------------------------ */
-    case LED_PHASE_PULSE_ON:
-        if ((nowMs - ledTimestampMs) >= LED_PULSE_ON_MS)
-        {
-            digitalWrite(LED_BUILTIN, LOW);
-            ledTimestampMs = nowMs;
-            ledPulsesLeft--;
-            ledPhase = (ledPulsesLeft > 0U) ? LED_PHASE_PULSE_GAP
-                                             : LED_PHASE_CYCLE_GAP;
-        }
-        break;
-
-    /* ------------------------------------------------------------------ */
-    case LED_PHASE_PULSE_GAP:
-        if ((nowMs - ledTimestampMs) >= LED_PULSE_GAP_MS)
-        {
-            digitalWrite(LED_BUILTIN, HIGH);
-            ledTimestampMs = nowMs;
-            ledPhase       = LED_PHASE_PULSE_ON;
-        }
-        break;
-
-    /* ------------------------------------------------------------------ */
-    case LED_PHASE_CYCLE_GAP:
-        if ((nowMs - ledTimestampMs) >= LED_CYCLE_GAP_MS)
-        {
-            if (slaveCount > 0U)
-            {
-                ledStartPulse(slaveCount);
-            }
-            else
-            {
-                /* No slaves – switch to heartbeat mode. */
-                digitalWrite(LED_BUILTIN, HIGH);
-                ledTimestampMs = nowMs;
-                ledPhase       = LED_PHASE_HEARTBEAT_ON;
-            }
-        }
-        break;
-
-    /* ------------------------------------------------------------------ */
-    default:
-        ledPhase = LED_PHASE_HEARTBEAT_OFF;
-        break;
+        ledToggleMs = nowMs;
+        digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
     }
 }
 
@@ -846,10 +730,10 @@ static void ledProcess(void)
  */
 static void masterProcess(void)
 {
+    updateLed();
     webServerProcess();
     processRxQueue();
     evictStalePeers();
-    ledProcess();
 
     uint32_t nowMs = millis();
 

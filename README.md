@@ -17,7 +17,7 @@ ESP32-based master transceiver for a home-monitoring sensor network. Discovers s
 - **Web dashboard** – single-page app served at `192.168.4.1` (AP) or DHCP address (STA); live peer table pushed via WebSocket every 2 s
 - **Home WiFi** – optional STA connection; on boot, shows the 5 strongest networks on the serial monitor for selection (2 s timeout, then auto-connects to `WIFI_DEFAULT_SSID`)
 - **Peer management** – tracks up to 10 slaves; marks a peer inactive after 60 s with no response
-- **LED indicator** – no-slave heartbeat (50 ms blink every 1 s); N active slaves → N × 250 ms pulses separated by 100 ms gaps, 1 s quiet period between cycles
+- **LED indicator** – 1 s blink while no slaves are active; 250 ms blink once at least one slave peer is known
 
 ## Getting Started
 
@@ -61,6 +61,8 @@ All packets share the same 13-byte `espnow_packet_t` wire format (header + senso
 | `POLL_PEER_TIMEOUT_MS` | `200` | Per-slave response timeout (ms) |
 | `PEER_STALE_MS` | `60 000` | Time before a silent peer is marked inactive (ms) |
 | `MAX_PEERS` | `10` | Maximum simultaneously tracked slaves |
+| `LED_SCAN_BLINK_MS` | `1 000` | LED toggle period while no slaves are active (ms) |
+| `LED_CONN_BLINK_MS` | `250` | LED toggle period when at least one slave is active (ms) |
 | `WIFI_DEFAULT_SSID` | `"CreatronE"` | Auto-connect target if user makes no serial choice |
 
 ## Project Structure
