@@ -1,15 +1,11 @@
 /**
  * @file main.cpp
- * @brief ESP-NOW Master Transceiver – peer discovery and polling.
+ * @brief ESP-NOW Master Transceiver – peer discovery, polling, and web dashboard.
  *
- * On startup the master broadcasts a PKT_DISCOVER frame to all ESPs on the
- * channel. Any slave that hears it responds with PKT_DISCOVER_RESP, which
- * causes the master to add the sender to its peer table and register it as
- * an ESP-NOW peer. Known peers are polled every POLL_INTERVAL_MS milliseconds;
- * each poll asks for the slave's current sensor data (PKT_POLL / PKT_POLL_RESP).
- *
- * The peer table and latest sensor readings are maintained in RAM so that a
- * future WebSocket server can serve them to a browser-based dashboard.
+ * On startup the master creates a WiFi soft-AP ("ESP32-HomeMon") so that a
+ * browser can connect and view the live dashboard at 192.168.4.1.
+ * It simultaneously operates ESP-NOW in AP_STA mode to broadcast
+ * PKT_DISCOVER frames and poll responding slave nodes every second.
  *
  * Sensor data structure is a placeholder – replace sensor_data_t fields to
  * match the actual home-monitoring signals (water, electricity, etc.).
@@ -18,9 +14,12 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_log.h>
 #include <stdint.h>
 #include <string.h>
 #include "gprintf.h"
+#include "espnow_types.h"
+#include "web_server.h"
 
 // ============================================================================
 // Constants and limits
@@ -29,14 +28,20 @@
 /** @brief This node's identifier (master is always 1). */
 #define MASTER_NODE_ID          1U
 
-/** @brief Maximum number of slave peers tracked simultaneously. */
-#define MAX_PEERS               10U
-
-/** @brief Length of a MAC address in bytes. */
-#define MAC_ADDR_LEN            6U
-
 /** @brief Depth of the inter-task receive queue (callback → loop). */
 #define RX_QUEUE_DEPTH          8U
+
+/** @brief WiFi soft-AP network name broadcast by the master. */
+#define AP_SSID                 "ESP32-HomeMon"
+
+/** @brief WiFi soft-AP password (min 8 chars for WPA2). */
+#define AP_PASSWORD             "homemonitor"
+
+/** @brief WiFi channel shared by the soft-AP and ESP-NOW. */
+#define AP_CHANNEL              1U
+
+/** @brief How often the peer table is pushed to WebSocket clients (ms). */
+#define WEB_BROADCAST_INTERVAL_MS 2000U
 
 /** @brief How often to re-broadcast a discovery frame (ms). */
 #define DISCOVER_INTERVAL_MS    10000U
@@ -59,60 +64,61 @@
 /** @brief Minimum required payload length for a valid received packet. */
 #define MIN_PACKET_LEN          ((int32_t)sizeof(espnow_packet_t))
 
+/** @brief Password used when connecting to the user's home WiFi network. */
+#define WIFI_PASSWORD           "L1nux112358"
+
+/** @brief Maximum number of scan results shown for user selection. */
+#define WIFI_MAX_SCAN_RESULTS   5U
+
+/** @brief Maximum SSID length including null terminator. */
+#define WIFI_SSID_MAX_LEN       33U
+
+/** @brief Timeout waiting for an async WiFi scan to complete (ms). */
+#define WIFI_SCAN_TIMEOUT_MS    10000U
+
+/** @brief Default SSID to connect to when no user input is received. */
+#define WIFI_DEFAULT_SSID       "CreatronE"
+
+/** @brief Time the user has to enter a network choice before auto-connecting (ms). */
+#define WIFI_SELECT_TIMEOUT_MS  2000U
+
+/** @brief Timeout waiting for a DHCP IP assignment after WiFi.begin() (ms). */
+#define WIFI_CONNECT_TIMEOUT_MS 15000U
+
+/** @brief Delay after WiFi.mode(WIFI_STA) before starting the scan (ms).
+ *  The radio stack is asynchronously initialised; without this pause
+ *  WiFi.scanNetworks() returns WIFI_SCAN_FAILED instantly. */
+#define WIFI_RADIO_SETTLE_MS    300U
+
+/** @brief Duration (ms) the LED stays on for each slave-count pulse. */
+#define LED_PULSE_ON_MS         250U
+
+/** @brief Gap (ms) between consecutive pulses within one cycle. */
+#define LED_PULSE_GAP_MS        100U
+
+/** @brief Quiet period (ms) after the last pulse before the next cycle. */
+#define LED_CYCLE_GAP_MS       1000U
+
+/** @brief Duration (ms) of the alive heartbeat pulse when no slaves are active. */
+#define LED_HEARTBEAT_ON_MS      50U
+
+/** @brief Total period (ms) of one heartbeat cycle (on + off). */
+#define LED_HEARTBEAT_PERIOD_MS 1000U
+
 // ============================================================================
-// Type definitions
+// Local type definitions (internal to this file)
 // ============================================================================
 
 /**
- * @brief Packet type field values.
+ * @brief Phases of the onboard LED indicator state machine.
  */
 typedef enum {
-    PKT_DISCOVER      = 0x01U, /**< Master → broadcast: find all slaves.        */
-    PKT_DISCOVER_RESP = 0x02U, /**< Slave  → master:    response to discovery.  */
-    PKT_POLL          = 0x03U, /**< Master → slave:     request sensor data.    */
-    PKT_POLL_RESP     = 0x04U, /**< Slave  → master:    current sensor data.    */
-} pkt_type_t;
-
-/**
- * @brief Placeholder sensor payload – replace fields for your application.
- *
- * Intended to carry home-monitoring readings such as water flow, electricity
- * consumption, temperature, open/closed contacts, etc.
- */
-typedef struct {
-    uint8_t  nodeId;        /**< Slave node identifier (self-assigned).          */
-    uint16_t analogValue;   /**< Example: raw 12-bit ADC reading.                */
-    uint8_t  digitalInputs; /**< Example: bitmask of up to 8 digital inputs.     */
-    uint32_t uptimeSec;     /**< Slave uptime in seconds since last boot.        */
-} sensor_data_t;
-
-/**
- * @brief Common header prepended to every packet.
- */
-typedef struct {
-    uint8_t  pktType;      /**< One of pkt_type_t.                              */
-    uint8_t  senderId;     /**< Sender's node ID.                               */
-    uint32_t timestampMs;  /**< Sender's millis() value at transmit time.       */
-} pkt_header_t;
-
-/**
- * @brief Complete over-the-air packet: header plus sensor payload.
- */
-typedef struct {
-    pkt_header_t  header; /**< Routing and protocol information.                */
-    sensor_data_t data;   /**< Sensor payload (placeholder).                   */
-} espnow_packet_t;
-
-/**
- * @brief One entry in the peer discovery table.
- */
-typedef struct {
-    uint8_t       macAddr[MAC_ADDR_LEN]; /**< Peer's MAC address.               */
-    uint8_t       nodeId;                /**< Peer's self-reported node ID.     */
-    uint32_t      lastSeenMs;            /**< millis() of the last reception.   */
-    sensor_data_t lastData;              /**< Most recent sensor reading.       */
-    uint8_t       isActive;              /**< 1 = active, 0 = timed out.        */
-} peer_entry_t;
+    LED_PHASE_HEARTBEAT_ON,  /**< LED on for LED_HEARTBEAT_ON_MS (no-slave alive blink). */
+    LED_PHASE_HEARTBEAT_OFF, /**< LED off; waiting until next heartbeat period.          */
+    LED_PHASE_PULSE_ON,      /**< LED on for LED_PULSE_ON_MS (one slave-count pulse).    */
+    LED_PHASE_PULSE_GAP,     /**< LED off LED_PULSE_GAP_MS gap between consecutive pulses. */
+    LED_PHASE_CYCLE_GAP,     /**< LED off LED_CYCLE_GAP_MS after the full pulse sequence. */
+} led_phase_t;
 
 /**
  * @brief Item stored in the ring buffer between the ESP-NOW callback and loop().
@@ -126,7 +132,13 @@ typedef struct {
  * @brief Master state-machine states.
  */
 typedef enum {
-    MASTER_STATE_INIT,           /**< Initialise WiFi and ESP-NOW.              */
+    MASTER_STATE_WIFI_SCAN,         /**< Set STA mode; start radio-settle timer.   */
+    MASTER_STATE_WIFI_RADIO_WAIT,   /**< Wait for radio stack to be ready.         */
+    MASTER_STATE_WIFI_SCAN_WAIT,    /**< Wait for async scan to complete.          */
+    MASTER_STATE_WIFI_SELECT,       /**< Display top 5; wait for user key press.   */
+    MASTER_STATE_WIFI_CONNECT,      /**< Connect to user-selected network.         */
+    MASTER_STATE_WIFI_CONNECT_WAIT, /**< Wait for DHCP IP assignment.              */
+    MASTER_STATE_INIT,              /**< Initialise WiFi AP and ESP-NOW.           */
     MASTER_STATE_DISCOVER,       /**< Broadcast a PKT_DISCOVER frame.           */
     MASTER_STATE_DISCOVER_WAIT,  /**< Wait for PKT_DISCOVER_RESP replies.       */
     MASTER_STATE_POLL_NEXT,      /**< Select the next active peer to poll.      */
@@ -147,7 +159,7 @@ static peer_entry_t    peerTable[MAX_PEERS];
 static uint8_t         peerCount        = 0U;
 
 /** @brief Current state of the master state machine. */
-static master_state_t  masterState      = MASTER_STATE_INIT;
+static master_state_t  masterState      = MASTER_STATE_WIFI_SCAN;
 
 /** @brief Timestamp recorded when the current state was entered (ms). */
 static uint32_t        stateTimestampMs = 0U;
@@ -160,6 +172,28 @@ static uint32_t        pollTimerMs      = 0U;
 
 /** @brief Index into peerTable of the peer currently being polled. */
 static uint8_t         pollPeerIndex    = 0U;
+
+/** @brief Timestamp of the last WebSocket broadcast (ms). */
+static uint32_t        webBroadcastMs   = 0U;
+
+/** @brief SSID of the user-selected network ('\0' if none chosen). */
+static char            selectedSsid[WIFI_SSID_MAX_LEN];
+
+/** @brief Number of entries stored in scanSsidList / scanRssiList. */
+static uint8_t         scanResultCount;
+
+/** @brief SSID strings for the top scanned networks (strongest first). */
+static char            scanSsidList[WIFI_MAX_SCAN_RESULTS][WIFI_SSID_MAX_LEN];
+
+/** @brief RSSI values (dBm, negative) for the top scanned networks. */
+static int32_t         scanRssiList[WIFI_MAX_SCAN_RESULTS];
+
+/** @brief True once the network selection menu has been displayed. */
+static bool            scanMenuDisplayed;
+
+/** @brief STA IP captured at the moment WL_CONNECTED is confirmed.
+ *  Empty string when no STA connection was established. */
+static char            confirmedStaIp[16];
 
 /** @brief Broadcast MAC address – reaches every node on the channel. */
 static const uint8_t   BROADCAST_MAC[MAC_ADDR_LEN] = {
@@ -180,10 +214,25 @@ static volatile uint8_t   rxHead = 0U;
 /** @brief Read index for rxQueue (updated by the main loop). */
 static volatile uint8_t   rxTail = 0U;
 
+// ---------------------------------------------------------------------------
+// LED state machine state
+// ---------------------------------------------------------------------------
+
+/** @brief Current phase of the LED indicator state machine. */
+static led_phase_t ledPhase       = LED_PHASE_HEARTBEAT_OFF;
+
+/** @brief millis() recorded when the current LED phase was entered. */
+static uint32_t    ledTimestampMs = 0U;
+
+/** @brief Number of 250 ms pulses remaining in the current slave-count cycle. */
+static uint8_t     ledPulsesLeft  = 0U;
+
 // ============================================================================
 // Forward declarations
 // ============================================================================
 
+static void     ledStartPulse       (uint8_t pulseCount);
+static void     ledProcess          (void);
 static void     masterProcess       (void);
 static void     processRxQueue      (void);
 static void     handleDiscoverResp  (const uint8_t *srcMac, const espnow_packet_t *pkt);
@@ -198,6 +247,9 @@ static uint8_t  findNextActivePeer  (uint8_t startIdx);
 static bool     initEspNowMaster    (void);
 static void     printPeerTable      (void);
 static void     macToString         (const uint8_t *mac, char *buf);
+static void     storeScanResults    (uint8_t totalFound);
+static void     displayScanMenu     (void);
+static bool     readSerialChoice    (uint8_t *outChoice);
 
 // ============================================================================
 // ESP-NOW callbacks  (execute in the WiFi task – not the Arduino loop task)
@@ -557,8 +609,17 @@ static uint8_t findNextActivePeer(uint8_t startIdx)
  */
 static bool initEspNowMaster(void)
 {
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
+    WiFi.mode(WIFI_AP_STA);
+
+    if (!WiFi.softAP(AP_SSID, AP_PASSWORD, (int32_t)AP_CHANNEL))
+    {
+        gprintf(gDBG, "[MASTER] WiFi.softAP() failed\r\n");
+        return false;
+    }
+
+    gprintf(gDBG, "[MASTER] Soft-AP \"%s\" on ch%u, IP=%s\r\n",
+            AP_SSID, (uint32_t)AP_CHANNEL,
+            WiFi.softAPIP().toString().c_str());
 
     if (esp_now_init() != ESP_OK)
     {
@@ -571,13 +632,200 @@ static bool initEspNowMaster(void)
 
     registerEspNowPeer(BROADCAST_MAC);
 
+    webServerInit(confirmedStaIp);
+
     uint8_t ownMac[MAC_ADDR_LEN];
     WiFi.macAddress(ownMac);
-
     char macStr[18];
     macToString(ownMac, macStr);
-    gprintf(gDBG, "[MASTER] ESP-NOW ready. Own MAC=%s\r\n", macStr);
+    gprintf(gDBG, "[MASTER] ESP-NOW ready. MAC=%s\r\n", macStr);
     return true;
+}
+
+// ============================================================================
+// WiFi scan / selection helpers
+// ============================================================================
+
+/**
+ * @brief Copies the strongest scan results into scanSsidList / scanRssiList.
+ *
+ * WiFi.scanNetworks() returns results sorted by descending RSSI, so the first
+ * WIFI_MAX_SCAN_RESULTS entries are already the strongest networks.
+ *
+ * @param[in] totalFound  Total network count returned by WiFi.scanComplete().
+ */
+static void storeScanResults(uint8_t totalFound)
+{
+    scanResultCount = (totalFound < (uint8_t)WIFI_MAX_SCAN_RESULTS)
+                      ? totalFound
+                      : (uint8_t)WIFI_MAX_SCAN_RESULTS;
+
+    for (uint8_t i = 0U; i < scanResultCount; i++)
+    {
+        /* WiFi.SSID() returns an Arduino String – .c_str() is used to
+         * immediately extract the raw pointer into a plain char array. */
+        strncpy(scanSsidList[i], WiFi.SSID(i).c_str(), WIFI_SSID_MAX_LEN - 1U);
+        scanSsidList[i][WIFI_SSID_MAX_LEN - 1U] = '\0';
+        scanRssiList[i] = (int32_t)WiFi.RSSI(i);
+    }
+}
+
+/**
+ * @brief Prints the network selection menu to the debug UART once.
+ */
+static void displayScanMenu(void)
+{
+    gprintf(gDBG, "\r\n[WIFI] Top %u networks (strongest first):\r\n",
+            (uint32_t)scanResultCount);
+    for (uint8_t i = 0U; i < scanResultCount; i++)
+    {
+        gprintf(gDBG, "  [%u] %-32s  %ddBm\r\n",
+                (uint32_t)(i + 1U),
+                scanSsidList[i],
+                (int32_t)scanRssiList[i]);
+    }
+    gprintf(gDBG, "\r\nEnter 1-%u to connect (auto-connecting to \"%s\" in %us): ",
+            (uint32_t)scanResultCount,
+            WIFI_DEFAULT_SSID,
+            (uint32_t)(WIFI_SELECT_TIMEOUT_MS / 1000U));
+}
+
+/**
+ * @brief Non-blocking read of one ASCII digit from the debug serial port.
+ *
+ * Returns false immediately if no byte is waiting.  Any character outside
+ * '1'..'5' sets *outChoice to 0 (treated as "skip WiFi").
+ *
+ * @param[out] outChoice  Receives the numeric choice (1..5 = valid, 0 = skip).
+ * @return                true if a byte was consumed; false if none available.
+ */
+static bool readSerialChoice(uint8_t *outChoice)
+{
+    if (!Serial.available())
+        return false;
+
+    uint8_t ch = (uint8_t)Serial.read();
+    if ((ch >= (uint8_t)'1') && (ch <= (uint8_t)'5'))
+    {
+        *outChoice = ch - (uint8_t)'0';
+    }
+    else
+    {
+        *outChoice = 0U;
+    }
+    return true;
+}
+
+// ============================================================================
+// LED status indicator
+// ============================================================================
+
+/**
+ * @brief Arms the LED for a new slave-count pulse sequence.
+ *
+ * Turns the LED on immediately and records the phase timestamp so that
+ * ledProcess() can manage the on/gap/cycle-gap timing non-blockingly.
+ *
+ * @param[in] pulseCount  Number of 250 ms pulses to emit (= active slave count).
+ */
+static void ledStartPulse(uint8_t pulseCount)
+{
+    ledPulsesLeft  = pulseCount;
+    ledTimestampMs = millis();
+    digitalWrite(LED_BUILTIN, HIGH);
+    ledPhase = LED_PHASE_PULSE_ON;
+}
+
+/**
+ * @brief Non-blocking LED indicator state machine; call from every loop().
+ *
+ * Behaviour:
+ *   - No active slaves: 50 ms heartbeat blink every 1 s (alive indication).
+ *   - N active slaves:  N consecutive 250 ms pulses separated by 100 ms gaps,
+ *                       followed by a 1 s quiet period before repeating.
+ *
+ * The active-slave count is re-sampled at every cycle boundary so that the
+ * display adapts immediately when slaves join or leave.
+ */
+static void ledProcess(void)
+{
+    uint32_t nowMs      = millis();
+    uint8_t  slaveCount = countActivePeers();
+
+    switch (ledPhase)
+    {
+    /* ------------------------------------------------------------------ */
+    case LED_PHASE_HEARTBEAT_ON:
+        if ((nowMs - ledTimestampMs) >= LED_HEARTBEAT_ON_MS)
+        {
+            digitalWrite(LED_BUILTIN, LOW);
+            ledTimestampMs = nowMs;
+            ledPhase       = LED_PHASE_HEARTBEAT_OFF;
+        }
+        break;
+
+    /* ------------------------------------------------------------------ */
+    case LED_PHASE_HEARTBEAT_OFF:
+        if ((nowMs - ledTimestampMs) >= (LED_HEARTBEAT_PERIOD_MS - LED_HEARTBEAT_ON_MS))
+        {
+            if (slaveCount > 0U)
+            {
+                ledStartPulse(slaveCount);
+            }
+            else
+            {
+                digitalWrite(LED_BUILTIN, HIGH);
+                ledTimestampMs = nowMs;
+                ledPhase       = LED_PHASE_HEARTBEAT_ON;
+            }
+        }
+        break;
+
+    /* ------------------------------------------------------------------ */
+    case LED_PHASE_PULSE_ON:
+        if ((nowMs - ledTimestampMs) >= LED_PULSE_ON_MS)
+        {
+            digitalWrite(LED_BUILTIN, LOW);
+            ledTimestampMs = nowMs;
+            ledPulsesLeft--;
+            ledPhase = (ledPulsesLeft > 0U) ? LED_PHASE_PULSE_GAP
+                                             : LED_PHASE_CYCLE_GAP;
+        }
+        break;
+
+    /* ------------------------------------------------------------------ */
+    case LED_PHASE_PULSE_GAP:
+        if ((nowMs - ledTimestampMs) >= LED_PULSE_GAP_MS)
+        {
+            digitalWrite(LED_BUILTIN, HIGH);
+            ledTimestampMs = nowMs;
+            ledPhase       = LED_PHASE_PULSE_ON;
+        }
+        break;
+
+    /* ------------------------------------------------------------------ */
+    case LED_PHASE_CYCLE_GAP:
+        if ((nowMs - ledTimestampMs) >= LED_CYCLE_GAP_MS)
+        {
+            if (slaveCount > 0U)
+            {
+                ledStartPulse(slaveCount);
+            }
+            else
+            {
+                /* No slaves – switch to heartbeat mode. */
+                digitalWrite(LED_BUILTIN, HIGH);
+                ledTimestampMs = nowMs;
+                ledPhase       = LED_PHASE_HEARTBEAT_ON;
+            }
+        }
+        break;
+
+    /* ------------------------------------------------------------------ */
+    default:
+        ledPhase = LED_PHASE_HEARTBEAT_OFF;
+        break;
+    }
 }
 
 // ============================================================================
@@ -598,13 +846,130 @@ static bool initEspNowMaster(void)
  */
 static void masterProcess(void)
 {
+    webServerProcess();
     processRxQueue();
     evictStalePeers();
+    ledProcess();
 
     uint32_t nowMs = millis();
 
     switch (masterState)
     {
+    /* ------------------------------------------------------------------ */
+    case MASTER_STATE_WIFI_SCAN:
+        gprintf(gDBG, "[WIFI] Initialising radio...\r\n");
+        WiFi.mode(WIFI_STA);
+        stateTimestampMs = nowMs;
+        masterState      = MASTER_STATE_WIFI_RADIO_WAIT;
+        break;
+
+    /* ------------------------------------------------------------------ */
+    case MASTER_STATE_WIFI_RADIO_WAIT:
+        if ((nowMs - stateTimestampMs) >= WIFI_RADIO_SETTLE_MS)
+        {
+            gprintf(gDBG, "[WIFI] Scanning for networks...\r\n");
+            WiFi.scanNetworks(/* async= */ true);
+            stateTimestampMs = nowMs;
+            masterState      = MASTER_STATE_WIFI_SCAN_WAIT;
+        }
+        break;
+
+    /* ------------------------------------------------------------------ */
+    case MASTER_STATE_WIFI_SCAN_WAIT:
+    {
+        int16_t scanResult = (int16_t)WiFi.scanComplete();
+        if (scanResult == (int16_t)WIFI_SCAN_RUNNING)
+        {
+            if ((nowMs - stateTimestampMs) >= WIFI_SCAN_TIMEOUT_MS)
+            {
+                gprintf(gDBG, "[WIFI] Scan timed out – skipping WiFi selection\r\n");
+                masterState = MASTER_STATE_INIT;
+            }
+        }
+        else if (scanResult <= 0)
+        {
+            gprintf(gDBG, "[WIFI] No networks found – skipping WiFi selection\r\n");
+            WiFi.scanDelete();
+            masterState = MASTER_STATE_INIT;
+        }
+        else
+        {
+            storeScanResults((uint8_t)scanResult);
+            WiFi.scanDelete();
+            scanMenuDisplayed = false;
+            stateTimestampMs  = nowMs;
+            masterState       = MASTER_STATE_WIFI_SELECT;
+        }
+        break;
+    }
+
+    /* ------------------------------------------------------------------ */
+    case MASTER_STATE_WIFI_SELECT:
+    {
+        if (!scanMenuDisplayed)
+        {
+            displayScanMenu();
+            scanMenuDisplayed = true;
+        }
+        uint8_t choice = 0U;
+        if (readSerialChoice(&choice))
+        {
+            if ((choice >= 1U) && (choice <= scanResultCount))
+            {
+                strncpy(selectedSsid,
+                        scanSsidList[choice - 1U],
+                        WIFI_SSID_MAX_LEN - 1U);
+                selectedSsid[WIFI_SSID_MAX_LEN - 1U] = '\0';
+                gprintf(gDBG, "\r\n[WIFI] Selected: \"%s\"\r\n", selectedSsid);
+                stateTimestampMs = nowMs;
+                masterState      = MASTER_STATE_WIFI_CONNECT;
+            }
+            else
+            {
+                gprintf(gDBG, "\r\n[WIFI] Skipping WiFi selection\r\n");
+                masterState = MASTER_STATE_INIT;
+            }
+        }
+        else if ((nowMs - stateTimestampMs) >= WIFI_SELECT_TIMEOUT_MS)
+        {
+            strncpy(selectedSsid, WIFI_DEFAULT_SSID, WIFI_SSID_MAX_LEN - 1U);
+            selectedSsid[WIFI_SSID_MAX_LEN - 1U] = '\0';
+            gprintf(gDBG, "\r\n[WIFI] Auto-connecting to \"%s\"\r\n", selectedSsid);
+            stateTimestampMs = nowMs;
+            masterState      = MASTER_STATE_WIFI_CONNECT;
+        }
+        break;
+    }
+
+    /* ------------------------------------------------------------------ */
+    case MASTER_STATE_WIFI_CONNECT:
+        gprintf(gDBG, "[WIFI] Connecting to \"%s\"...\r\n", selectedSsid);
+        WiFi.begin((const char *)selectedSsid, WIFI_PASSWORD);
+        stateTimestampMs = nowMs;
+        masterState      = MASTER_STATE_WIFI_CONNECT_WAIT;
+        break;
+
+    /* ------------------------------------------------------------------ */
+    case MASTER_STATE_WIFI_CONNECT_WAIT:
+    {
+        if (WiFi.status() == WL_CONNECTED)
+        {
+            IPAddress staIp = WiFi.localIP();
+            snprintf(confirmedStaIp, sizeof(confirmedStaIp), "%u.%u.%u.%u",
+                     staIp[0], staIp[1], staIp[2], staIp[3]);
+            gprintf(gDBG, "[WIFI] Connected! IP=%s\r\n", confirmedStaIp);
+            masterState = MASTER_STATE_INIT;
+        }
+        else if ((nowMs - stateTimestampMs) >= WIFI_CONNECT_TIMEOUT_MS)
+        {
+            gprintf(gDBG, "[WIFI] Connection timed out – continuing without WiFi\r\n");
+            confirmedStaIp[0] = '\0';
+            selectedSsid[0]   = '\0';
+            masterState       = MASTER_STATE_INIT;
+        }
+        break;
+    }
+
     /* ------------------------------------------------------------------ */
     case MASTER_STATE_INIT:
         memset(peerTable, 0, sizeof(peerTable));
@@ -640,9 +1005,11 @@ static void masterProcess(void)
             gprintf(gDBG, "[MASTER] Discovery window closed. Active peers: %u\r\n",
                     (uint32_t)countActivePeers());
             printPeerTable();
-            pollPeerIndex = 0U;
-            pollTimerMs   = nowMs;
-            masterState   = MASTER_STATE_IDLE;
+            webServerBroadcast(peerTable, peerCount, nowMs);
+            webBroadcastMs = nowMs;
+            pollPeerIndex  = 0U;
+            pollTimerMs    = nowMs;
+            masterState    = MASTER_STATE_IDLE;
         }
         break;
 
@@ -652,7 +1019,10 @@ static void masterProcess(void)
         uint8_t nextIdx = findNextActivePeer(pollPeerIndex);
         if (nextIdx >= MAX_PEERS)
         {
-            masterState = MASTER_STATE_IDLE;
+            /* Entire poll cycle finished – push fresh data to browsers. */
+            webServerBroadcast(peerTable, peerCount, nowMs);
+            webBroadcastMs = nowMs;
+            masterState    = MASTER_STATE_IDLE;
         }
         else
         {
@@ -690,6 +1060,12 @@ static void masterProcess(void)
             pollPeerIndex = 0U;
             masterState   = MASTER_STATE_POLL_NEXT;
         }
+        else if ((nowMs - webBroadcastMs) >= WEB_BROADCAST_INTERVAL_MS)
+        {
+            /* Heartbeat: keeps browser table alive between poll cycles. */
+            webServerBroadcast(peerTable, peerCount, nowMs);
+            webBroadcastMs = nowMs;
+        }
         break;
 
     /* ------------------------------------------------------------------ */
@@ -720,7 +1096,10 @@ static void masterProcess(void)
  */
 void setup(void)
 {
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, LOW);
     initUartBaud(gDBG, 115200U);
+    esp_log_level_set("*", ESP_LOG_NONE);   /* suppress ESP-IDF WiFi/radio logs on UART */
     clear_screen(gDBG);
     gprintf(gDBG, "\r\n========================================\r\n");
     gprintf(gDBG, "  ESP-NOW Master Transceiver  v1.0\r\n");
