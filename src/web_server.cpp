@@ -292,7 +292,7 @@ static void onWsEvent(AsyncWebSocket       *server,
  */
 static void handleRoot(AsyncWebServerRequest *request)
 {
-    request->send_P(200, "text/html", HTML_PAGE);
+    request->send(200, "text/html", HTML_PAGE);
 }
 
 // ============================================================================
