@@ -67,28 +67,11 @@
 /** @brief Password used when connecting to the user's home WiFi network. */
 #define WIFI_PASSWORD           "L1nux112358"
 
-/** @brief Maximum number of scan results shown for user selection. */
-#define WIFI_MAX_SCAN_RESULTS   5U
-
-/** @brief Maximum SSID length including null terminator. */
-#define WIFI_SSID_MAX_LEN       33U
-
-/** @brief Timeout waiting for an async WiFi scan to complete (ms). */
-#define WIFI_SCAN_TIMEOUT_MS    10000U
-
-/** @brief Default SSID to connect to when no user input is received. */
+/** @brief SSID of the home WiFi network to connect to as a station. */
 #define WIFI_DEFAULT_SSID       "CreatronE"
-
-/** @brief Time the user has to enter a network choice before auto-connecting (ms). */
-#define WIFI_SELECT_TIMEOUT_MS  2000U
 
 /** @brief Timeout waiting for a DHCP IP assignment after WiFi.begin() (ms). */
 #define WIFI_CONNECT_TIMEOUT_MS 15000U
-
-/** @brief Delay after WiFi.mode(WIFI_STA) before starting the scan (ms).
- *  The radio stack is asynchronously initialised; without this pause
- *  WiFi.scanNetworks() returns WIFI_SCAN_FAILED instantly. */
-#define WIFI_RADIO_SETTLE_MS    300U
 
 /** @brief LED blink interval while no slave peers are active (ms). */
 #define LED_SCAN_BLINK_MS       1000U
@@ -112,13 +95,9 @@ typedef struct {
  * @brief Master state-machine states.
  */
 typedef enum {
-    MASTER_STATE_WIFI_SCAN,         /**< Set STA mode; start radio-settle timer.   */
-    MASTER_STATE_WIFI_RADIO_WAIT,   /**< Wait for radio stack to be ready.         */
-    MASTER_STATE_WIFI_SCAN_WAIT,    /**< Wait for async scan to complete.          */
-    MASTER_STATE_WIFI_SELECT,       /**< Display top 5; wait for user key press.   */
-    MASTER_STATE_WIFI_CONNECT,      /**< Connect to user-selected network.         */
-    MASTER_STATE_WIFI_CONNECT_WAIT, /**< Wait for DHCP IP assignment.              */
-    MASTER_STATE_INIT,              /**< Initialise WiFi AP and ESP-NOW.           */
+    MASTER_STATE_WIFI_CONNECT,      /**< Set STA mode; begin connection to home AP. */
+    MASTER_STATE_WIFI_CONNECT_WAIT, /**< Wait for DHCP IP assignment or timeout.    */
+    MASTER_STATE_INIT,              /**< Initialise WiFi AP and ESP-NOW.            */
     MASTER_STATE_DISCOVER,       /**< Broadcast a PKT_DISCOVER frame.           */
     MASTER_STATE_DISCOVER_WAIT,  /**< Wait for PKT_DISCOVER_RESP replies.       */
     MASTER_STATE_POLL_NEXT,      /**< Select the next active peer to poll.      */
@@ -139,7 +118,7 @@ static peer_entry_t    peerTable[MAX_PEERS];
 static uint8_t         peerCount        = 0U;
 
 /** @brief Current state of the master state machine. */
-static master_state_t  masterState      = MASTER_STATE_WIFI_SCAN;
+static master_state_t  masterState      = MASTER_STATE_WIFI_CONNECT;
 
 /** @brief Timestamp recorded when the current state was entered (ms). */
 static uint32_t        stateTimestampMs = 0U;
@@ -155,21 +134,6 @@ static uint8_t         pollPeerIndex    = 0U;
 
 /** @brief Timestamp of the last WebSocket broadcast (ms). */
 static uint32_t        webBroadcastMs   = 0U;
-
-/** @brief SSID of the user-selected network ('\0' if none chosen). */
-static char            selectedSsid[WIFI_SSID_MAX_LEN];
-
-/** @brief Number of entries stored in scanSsidList / scanRssiList. */
-static uint8_t         scanResultCount;
-
-/** @brief SSID strings for the top scanned networks (strongest first). */
-static char            scanSsidList[WIFI_MAX_SCAN_RESULTS][WIFI_SSID_MAX_LEN];
-
-/** @brief RSSI values (dBm, negative) for the top scanned networks. */
-static int32_t         scanRssiList[WIFI_MAX_SCAN_RESULTS];
-
-/** @brief True once the network selection menu has been displayed. */
-static bool            scanMenuDisplayed;
 
 /** @brief STA IP captured at the moment WL_CONNECTED is confirmed.
  *  Empty string when no STA connection was established. */
@@ -220,15 +184,12 @@ static uint8_t  findNextActivePeer  (uint8_t startIdx);
 static bool     initEspNowMaster    (void);
 static void     printPeerTable      (void);
 static void     macToString         (const uint8_t *mac, char *buf);
-static void     storeScanResults    (uint8_t totalFound);
-static void     displayScanMenu     (void);
-static bool     readSerialChoice    (uint8_t *outChoice);
 
 // ============================================================================
 // ESP-NOW callbacks  (execute in the WiFi task – not the Arduino loop task)
 // ============================================================================
 
-/**
+/** ---------------------------------------------------------------------------
  * @brief Invoked by ESP-NOW after each attempted transmission.
  * @param[in] macAddr   Destination MAC of the transmission.
  * @param[in] status    ESP_NOW_SEND_SUCCESS or ESP_NOW_SEND_FAIL.
@@ -242,7 +203,7 @@ static void onDataSent(const uint8_t *macAddr, esp_now_send_status_t status)
     }
 }
 
-/**
+/** ---------------------------------------------------------------------------
  * @brief Invoked by ESP-NOW when a packet is received.
  *
  * Runs in the WiFi task context.  Copies the frame into rxQueue so that the
@@ -279,7 +240,7 @@ static void onDataRecv(const uint8_t *srcMac,
 // Peer table management
 // ============================================================================
 
-/**
+/** ---------------------------------------------------------------------------
  * @brief Searches peerTable for an entry with a matching MAC address.
  * @param[in] macAddr   6-byte MAC address to find.
  * @return              Index in peerTable on success, MAX_PEERS if not found.
@@ -294,7 +255,7 @@ static uint8_t findPeer(const uint8_t *macAddr)
     return MAX_PEERS;
 }
 
-/**
+/** ---------------------------------------------------------------------------
  * @brief Adds a new peer to peerTable, or returns the index of an existing one.
  *
  * If the MAC is already in the table the existing entry is reactivated and its
@@ -340,7 +301,7 @@ static uint8_t addOrUpdatePeer(const uint8_t *macAddr, uint8_t nodeId)
     return newIdx;
 }
 
-/**
+/** ---------------------------------------------------------------------------
  * @brief Registers a MAC address with the ESP-NOW driver as a unicast peer.
  * @param[in] macAddr   6-byte MAC address to register.
  */
@@ -365,7 +326,7 @@ static void registerEspNowPeer(const uint8_t *macAddr)
     }
 }
 
-/**
+/** ---------------------------------------------------------------------------
  * @brief Marks peers inactive when no frame has been received within PEER_STALE_MS.
  */
 static void evictStalePeers(void)
@@ -389,7 +350,7 @@ static void evictStalePeers(void)
 // Packet send / receive handling
 // ============================================================================
 
-/**
+/** ---------------------------------------------------------------------------
  * @brief Constructs and sends a typed ESP-NOW packet to the given destination.
  *
  * The data fields are zeroed; this is appropriate for PKT_DISCOVER and
@@ -415,7 +376,7 @@ static void sendPacket(const uint8_t *destMac, pkt_type_t pktType)
     }
 }
 
-/**
+/** ---------------------------------------------------------------------------
  * @brief Handles a PKT_DISCOVER_RESP received from a slave.
  *
  * Adds the slave to the peer table (or updates it if already known) and
@@ -433,7 +394,7 @@ static void handleDiscoverResp(const uint8_t *srcMac, const espnow_packet_t *pkt
     }
 }
 
-/**
+/** ---------------------------------------------------------------------------
  * @brief Handles a PKT_POLL_RESP received from a known slave.
  *
  * Updates the peer's lastSeenMs timestamp and sensor data snapshot.
@@ -464,7 +425,7 @@ static void handlePollResp(const uint8_t *srcMac, const espnow_packet_t *pkt)
             pkt->data.uptimeSec);
 }
 
-/**
+/** ---------------------------------------------------------------------------
  * @brief Drains rxQueue and dispatches each packet to its protocol handler.
  *
  * Must be called from loop() – never from the ESP-NOW callback context.
@@ -498,7 +459,7 @@ static void processRxQueue(void)
 // Utility helpers
 // ============================================================================
 
-/**
+/** ---------------------------------------------------------------------------
  * @brief Formats six raw MAC bytes into the "XX:XX:XX:XX:XX:XX\0" string.
  * @param[in]  mac  6-byte MAC address.
  * @param[out] buf  Output buffer – caller must provide at least 18 bytes.
@@ -515,7 +476,7 @@ static void macToString(const uint8_t *mac, char *buf)
     buf[17] = '\0';
 }
 
-/**
+/** ---------------------------------------------------------------------------
  * @brief Prints the full peer table to the debug UART.
  */
 static void printPeerTable(void)
@@ -538,7 +499,7 @@ static void printPeerTable(void)
     gprintf(gDBG, "[MASTER] ==========================================\r\n\r\n");
 }
 
-/**
+/** ---------------------------------------------------------------------------
  * @brief Returns the count of peers currently marked as active.
  * @return Number of active peers (0..MAX_PEERS).
  */
@@ -553,7 +514,7 @@ static uint8_t countActivePeers(void)
     return count;
 }
 
-/**
+/** ---------------------------------------------------------------------------
  * @brief Finds the lowest-index active peer at or after startIdx.
  * @param[in] startIdx  First index to check.
  * @return              Peer table index, or MAX_PEERS when no active peer is found.
@@ -572,7 +533,7 @@ static uint8_t findNextActivePeer(uint8_t startIdx)
 // Initialisation
 // ============================================================================
 
-/**
+/** ---------------------------------------------------------------------------
  * @brief Initialises WiFi in station mode and starts the ESP-NOW stack.
  *
  * Registers both the send and receive callbacks, then adds the broadcast
@@ -612,80 +573,10 @@ static bool initEspNowMaster(void)
     char macStr[18];
     macToString(ownMac, macStr);
     gprintf(gDBG, "[MASTER] ESP-NOW ready. MAC=%s\r\n", macStr);
-    return true;
-}
 
-// ============================================================================
-// WiFi scan / selection helpers
-// ============================================================================
-
-/**
- * @brief Copies the strongest scan results into scanSsidList / scanRssiList.
- *
- * WiFi.scanNetworks() returns results sorted by descending RSSI, so the first
- * WIFI_MAX_SCAN_RESULTS entries are already the strongest networks.
- *
- * @param[in] totalFound  Total network count returned by WiFi.scanComplete().
- */
-static void storeScanResults(uint8_t totalFound)
-{
-    scanResultCount = (totalFound < (uint8_t)WIFI_MAX_SCAN_RESULTS)
-                      ? totalFound
-                      : (uint8_t)WIFI_MAX_SCAN_RESULTS;
-
-    for (uint8_t i = 0U; i < scanResultCount; i++)
-    {
-        /* WiFi.SSID() returns an Arduino String – .c_str() is used to
-         * immediately extract the raw pointer into a plain char array. */
-        strncpy(scanSsidList[i], WiFi.SSID(i).c_str(), WIFI_SSID_MAX_LEN - 1U);
-        scanSsidList[i][WIFI_SSID_MAX_LEN - 1U] = '\0';
-        scanRssiList[i] = (int32_t)WiFi.RSSI(i);
-    }
-}
-
-/**
- * @brief Prints the network selection menu to the debug UART once.
- */
-static void displayScanMenu(void)
-{
-    gprintf(gDBG, "\r\n[WIFI] Top %u networks (strongest first):\r\n",
-            (uint32_t)scanResultCount);
-    for (uint8_t i = 0U; i < scanResultCount; i++)
-    {
-        gprintf(gDBG, "  [%u] %-32s  %ddBm\r\n",
-                (uint32_t)(i + 1U),
-                scanSsidList[i],
-                (int32_t)scanRssiList[i]);
-    }
-    gprintf(gDBG, "\r\nEnter 1-%u to connect (auto-connecting to \"%s\" in %us): ",
-            (uint32_t)scanResultCount,
-            WIFI_DEFAULT_SSID,
-            (uint32_t)(WIFI_SELECT_TIMEOUT_MS / 1000U));
-}
-
-/**
- * @brief Non-blocking read of one ASCII digit from the debug serial port.
- *
- * Returns false immediately if no byte is waiting.  Any character outside
- * '1'..'5' sets *outChoice to 0 (treated as "skip WiFi").
- *
- * @param[out] outChoice  Receives the numeric choice (1..5 = valid, 0 = skip).
- * @return                true if a byte was consumed; false if none available.
- */
-static bool readSerialChoice(uint8_t *outChoice)
-{
-    if (!Serial.available())
-        return false;
-
-    uint8_t ch = (uint8_t)Serial.read();
-    if ((ch >= (uint8_t)'1') && (ch <= (uint8_t)'5'))
-    {
-        *outChoice = ch - (uint8_t)'0';
-    }
-    else
-    {
-        *outChoice = 0U;
-    }
+    /* Re-apply after WiFi/ESP-NOW init: the drivers re-register their log
+     * tags during init and can override the wildcard level set in setup(). */
+    esp_log_level_set("*", ESP_LOG_NONE);
     return true;
 }
 
@@ -693,7 +584,7 @@ static bool readSerialChoice(uint8_t *outChoice)
 // LED status indicator
 // ============================================================================
 
-/**
+/** ---------------------------------------------------------------------------
  * @brief Toggles the onboard LED at a rate that reflects slave connection state.
  *
  * Blinks at LED_SCAN_BLINK_MS while no active slave peers are known, and
@@ -716,7 +607,7 @@ static void updateLed(void)
 // Master state machine
 // ============================================================================
 
-/**
+/** ---------------------------------------------------------------------------
  * @brief Non-blocking master transceiver state machine.
  *
  * Must be called on every iteration of loop().  Processes the receive queue,
@@ -724,9 +615,11 @@ static void updateLed(void)
  * millis()-based timers without blocking.
  *
  * State flow:
- *   INIT → DISCOVER → DISCOVER_WAIT → IDLE ↔ POLL_NEXT → POLL_SEND
- *                                              ↑                 ↓
- *                                         POLL_WAIT ←───────────┘
+ *   WIFI_CONNECT → WIFI_CONNECT_WAIT → INIT → DISCOVER → DISCOVER_WAIT
+ *                                                ↓             ↓
+ *                                         POLL_NEXT ← IDLE ← (done)
+ *                                              ↓
+ *                                         POLL_SEND → POLL_WAIT → POLL_NEXT
  */
 static void masterProcess(void)
 {
@@ -740,95 +633,10 @@ static void masterProcess(void)
     switch (masterState)
     {
     /* ------------------------------------------------------------------ */
-    case MASTER_STATE_WIFI_SCAN:
-        gprintf(gDBG, "[WIFI] Initialising radio...\r\n");
-        WiFi.mode(WIFI_STA);
-        stateTimestampMs = nowMs;
-        masterState      = MASTER_STATE_WIFI_RADIO_WAIT;
-        break;
-
-    /* ------------------------------------------------------------------ */
-    case MASTER_STATE_WIFI_RADIO_WAIT:
-        if ((nowMs - stateTimestampMs) >= WIFI_RADIO_SETTLE_MS)
-        {
-            gprintf(gDBG, "[WIFI] Scanning for networks...\r\n");
-            WiFi.scanNetworks(/* async= */ true);
-            stateTimestampMs = nowMs;
-            masterState      = MASTER_STATE_WIFI_SCAN_WAIT;
-        }
-        break;
-
-    /* ------------------------------------------------------------------ */
-    case MASTER_STATE_WIFI_SCAN_WAIT:
-    {
-        int16_t scanResult = (int16_t)WiFi.scanComplete();
-        if (scanResult == (int16_t)WIFI_SCAN_RUNNING)
-        {
-            if ((nowMs - stateTimestampMs) >= WIFI_SCAN_TIMEOUT_MS)
-            {
-                gprintf(gDBG, "[WIFI] Scan timed out – skipping WiFi selection\r\n");
-                masterState = MASTER_STATE_INIT;
-            }
-        }
-        else if (scanResult <= 0)
-        {
-            gprintf(gDBG, "[WIFI] No networks found – skipping WiFi selection\r\n");
-            WiFi.scanDelete();
-            masterState = MASTER_STATE_INIT;
-        }
-        else
-        {
-            storeScanResults((uint8_t)scanResult);
-            WiFi.scanDelete();
-            scanMenuDisplayed = false;
-            stateTimestampMs  = nowMs;
-            masterState       = MASTER_STATE_WIFI_SELECT;
-        }
-        break;
-    }
-
-    /* ------------------------------------------------------------------ */
-    case MASTER_STATE_WIFI_SELECT:
-    {
-        if (!scanMenuDisplayed)
-        {
-            displayScanMenu();
-            scanMenuDisplayed = true;
-        }
-        uint8_t choice = 0U;
-        if (readSerialChoice(&choice))
-        {
-            if ((choice >= 1U) && (choice <= scanResultCount))
-            {
-                strncpy(selectedSsid,
-                        scanSsidList[choice - 1U],
-                        WIFI_SSID_MAX_LEN - 1U);
-                selectedSsid[WIFI_SSID_MAX_LEN - 1U] = '\0';
-                gprintf(gDBG, "\r\n[WIFI] Selected: \"%s\"\r\n", selectedSsid);
-                stateTimestampMs = nowMs;
-                masterState      = MASTER_STATE_WIFI_CONNECT;
-            }
-            else
-            {
-                gprintf(gDBG, "\r\n[WIFI] Skipping WiFi selection\r\n");
-                masterState = MASTER_STATE_INIT;
-            }
-        }
-        else if ((nowMs - stateTimestampMs) >= WIFI_SELECT_TIMEOUT_MS)
-        {
-            strncpy(selectedSsid, WIFI_DEFAULT_SSID, WIFI_SSID_MAX_LEN - 1U);
-            selectedSsid[WIFI_SSID_MAX_LEN - 1U] = '\0';
-            gprintf(gDBG, "\r\n[WIFI] Auto-connecting to \"%s\"\r\n", selectedSsid);
-            stateTimestampMs = nowMs;
-            masterState      = MASTER_STATE_WIFI_CONNECT;
-        }
-        break;
-    }
-
-    /* ------------------------------------------------------------------ */
     case MASTER_STATE_WIFI_CONNECT:
-        gprintf(gDBG, "[WIFI] Connecting to \"%s\"...\r\n", selectedSsid);
-        WiFi.begin((const char *)selectedSsid, WIFI_PASSWORD);
+        gprintf(gDBG, "[WIFI] Connecting to \"%s\"...\r\n", WIFI_DEFAULT_SSID);
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(WIFI_DEFAULT_SSID, WIFI_PASSWORD);
         stateTimestampMs = nowMs;
         masterState      = MASTER_STATE_WIFI_CONNECT_WAIT;
         break;
@@ -841,14 +649,14 @@ static void masterProcess(void)
             IPAddress staIp = WiFi.localIP();
             snprintf(confirmedStaIp, sizeof(confirmedStaIp), "%u.%u.%u.%u",
                      staIp[0], staIp[1], staIp[2], staIp[3]);
-            gprintf(gDBG, "[WIFI] Connected! IP=%s\r\n", confirmedStaIp);
+            gprintf(gDBG, "[WIFI] Connected! STA IP=%s\r\n", confirmedStaIp);
             masterState = MASTER_STATE_INIT;
         }
         else if ((nowMs - stateTimestampMs) >= WIFI_CONNECT_TIMEOUT_MS)
         {
-            gprintf(gDBG, "[WIFI] Connection timed out – continuing without WiFi\r\n");
+            gprintf(gDBG, "[WIFI] \"%s\" not reachable – AP-only mode\r\n",
+                    WIFI_DEFAULT_SSID);
             confirmedStaIp[0] = '\0';
-            selectedSsid[0]   = '\0';
             masterState       = MASTER_STATE_INIT;
         }
         break;
@@ -972,7 +780,7 @@ static void masterProcess(void)
 // Arduino entry points
 // ============================================================================
 
-/**
+/** ---------------------------------------------------------------------------
  * @brief One-time setup: initialise the debug UART and print the boot banner.
  *
  * ESP-NOW and WiFi initialisation are deferred to MASTER_STATE_INIT so
@@ -987,8 +795,10 @@ void setup(void)
     clear_screen(gDBG);
     gprintf(gDBG, "\r\n========================================\r\n");
     gprintf(gDBG, "  ESP-NOW Master Transceiver  v1.0\r\n");
-    gprintf(gDBG, "  Home Monitor – discovery mode\r\n");
+    gprintf(gDBG, "  Home Monitor ... discovery mode\r\n");
     gprintf(gDBG, "========================================\r\n\r\n");
+    gprintf(gDBG, "[WIFI] Attempting STA connect to \"%s\"\r\n", WIFI_DEFAULT_SSID);
+    gprintf(gDBG, "[WIFI] Dashboard URLs will be printed once ready\r\n\r\n");
 }
 
 /**
