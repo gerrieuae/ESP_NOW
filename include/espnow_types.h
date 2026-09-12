@@ -83,6 +83,22 @@ typedef enum {
 } pkt_type_t;
 
 // ============================================================================
+// Event types
+// ============================================================================
+
+/**
+ * @brief Identifies the kind of unsolicited event carried by a PKT_EVENT.
+ *
+ * Carried as the first byte of event_payload_t.
+ */
+typedef enum {
+    EVENT_NONE          = 0x00U, /**< Unused / invalid.                        */
+    EVENT_METER_READING = 0x01U, /**< A new cumulative meter reading (payload
+                                       value), e.g. from a water/electricity
+                                       meter or a camera relayed via a repeater. */
+} event_type_t;
+
+// ============================================================================
 // Payload structures
 // ============================================================================
 
@@ -100,6 +116,19 @@ typedef struct {
     uint8_t  digitalInputs; /**< Placeholder: bitmask of up to 8 DI channels. */
     uint32_t uptimeSec;     /**< Slave uptime in seconds since last boot.     */
 } sensor_data_t;
+
+/**
+ * @brief EVENT_METER_READING payload: a single cumulative reading.
+ *
+ * Carried inside espnow_packet_t.payload for PKT_EVENT. value is a
+ * monotonically-increasing cumulative count (e.g. total litres or kWh) —
+ * the master's watchdog (see docs/plan.md §4) compares consecutive values
+ * to detect a meter that keeps changing without ever holding steady.
+ */
+typedef struct {
+    uint8_t  eventType; /**< One of event_type_t.                             */
+    uint32_t value;     /**< Cumulative reading at header.timestampMs.        */
+} event_payload_t;
 
 /**
  * @brief Common header prepended to every over-the-air packet.
@@ -145,6 +174,12 @@ typedef struct {
     uint32_t      lastSeenMs;            /**< millis() of last received frame.*/
     sensor_data_t lastData;              /**< Most recent sensor snapshot.    */
     uint8_t       isActive;              /**< 1 = active, 0 = timed out.      */
+
+    /* "Hasn't stopped changing" watchdog state (EVENT_METER_READING). */
+    uint32_t      lastEventValue;        /**< Last EVENT_METER_READING value. */
+    uint32_t      activeSinceMs;         /**< millis() when the value most recently started continuously changing. */
+    uint8_t       valueActive;           /**< 1 while consecutive readings keep changing (e.g. water flowing). */
+    uint8_t       watchdogAlarmActive;   /**< 1 while the "hasn't stopped" alarm is raised for this peer. */
 } peer_entry_t;
 
 //=============================================================================

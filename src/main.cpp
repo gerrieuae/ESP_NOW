@@ -79,6 +79,12 @@
 /** @brief LED blink interval when at least one slave peer is active (ms). */
 #define LED_CONN_BLINK_MS        250U
 
+/** @brief If an EVENT_METER_READING value keeps changing continuously for
+ *  this long without ever holding steady, raise the "hasn't stopped" alarm
+ *  (e.g. a tap left running, a stuck valve). Fixed for now; remote tuning
+ *  via PKT_CMD is a possible future enhancement (see docs/plan.md). */
+#define WATER_NO_STOP_TIMEOUT_MS 1800000U
+
 // ============================================================================
 // Local type definitions (internal to this file)
 // ============================================================================
@@ -174,12 +180,16 @@ static void     masterProcess       (void);
 static void     processRxQueue      (void);
 static void     handleDiscoverResp  (const uint8_t *srcMac, const espnow_packet_t *pkt);
 static void     handlePollResp      (const uint8_t *srcMac, const espnow_packet_t *pkt);
+static void     handleEvent         (const uint8_t *srcMac, const espnow_packet_t *pkt);
+static void     refreshPeerRoute    (uint8_t peerIdx, const uint8_t *srcMac, uint8_t nodeType);
+static void     updateValueWatchdog (uint8_t peerIdx, uint32_t newValue, uint32_t nowMs);
 static uint8_t  findPeer            (uint8_t nodeId);
 static uint8_t  addOrUpdatePeer     (const uint8_t *macAddr, uint8_t nodeId, uint8_t nodeType);
 static void     registerEspNowPeer  (const uint8_t *macAddr);
 static void     evictStalePeers     (void);
 static void     sendPacket          (const uint8_t *destMac, pkt_type_t pktType);
 static void     unpackSensorData    (const espnow_packet_t *pkt, sensor_data_t *data);
+static void     unpackEventData     (const espnow_packet_t *pkt, event_payload_t *data);
 static uint8_t  countActivePeers    (void);
 static uint8_t  findNextActivePeer  (uint8_t startIdx);
 static bool     initEspNowMaster    (void);
@@ -411,6 +421,41 @@ static void unpackSensorData(const espnow_packet_t *pkt, sensor_data_t *data)
 }
 
 /** ---------------------------------------------------------------------------
+ * @brief Unpacks an event_payload_t out of a received packet's payload buffer.
+ * @param[in]  pkt   Received packet whose payload holds an event_payload_t.
+ * @param[out] data  Destination event payload.
+ */
+static void unpackEventData(const espnow_packet_t *pkt, event_payload_t *data)
+{
+    if (pkt->payloadLen < (uint8_t)sizeof(event_payload_t))
+    {
+        memset(data, 0, sizeof(event_payload_t));
+        return;
+    }
+    memcpy(data, pkt->payload, sizeof(event_payload_t));
+}
+
+/** ---------------------------------------------------------------------------
+ * @brief Refreshes a known peer's route MAC, activity, and node type.
+ *
+ * Shared by handlePollResp and handleEvent: any inbound traffic from a known
+ * peer keeps its route (which may be a repeater's MAC) and activity flag
+ * up to date.
+ *
+ * @param[in] peerIdx   Index into peerTable of the peer to refresh.
+ * @param[in] srcMac    6-byte ESP-NOW radio source MAC (route address).
+ * @param[in] nodeType  Peer's self-reported role (node_type_t).
+ */
+static void refreshPeerRoute(uint8_t peerIdx, const uint8_t *srcMac, uint8_t nodeType)
+{
+    memcpy(peerTable[peerIdx].macAddr, srcMac, MAC_ADDR_LEN);
+    registerEspNowPeer(srcMac);
+    peerTable[peerIdx].lastSeenMs = millis();
+    peerTable[peerIdx].isActive   = 1U;
+    peerTable[peerIdx].nodeType   = nodeType;
+}
+
+/** ---------------------------------------------------------------------------
  * @brief Handles a PKT_DISCOVER_RESP received from a slave.
  *
  * Adds the slave to the peer table (or updates it if already known) and
@@ -457,11 +502,7 @@ static void handlePollResp(const uint8_t *srcMac, const espnow_packet_t *pkt)
     sensor_data_t data;
     unpackSensorData(pkt, &data);
 
-    memcpy(peerTable[peerIdx].macAddr, srcMac, MAC_ADDR_LEN);
-    registerEspNowPeer(srcMac);
-    peerTable[peerIdx].lastSeenMs = millis();
-    peerTable[peerIdx].isActive   = 1U;
-    peerTable[peerIdx].nodeType   = pkt->header.nodeType;
+    refreshPeerRoute(peerIdx, srcMac, pkt->header.nodeType);
     memcpy(&peerTable[peerIdx].lastData, &data, sizeof(sensor_data_t));
 
     gprintf(gDBG,
@@ -470,6 +511,102 @@ static void handlePollResp(const uint8_t *srcMac, const espnow_packet_t *pkt)
             (uint32_t)data.analogValue,
             (uint32_t)data.digitalInputs,
             data.uptimeSec);
+}
+
+/** ---------------------------------------------------------------------------
+ * @brief Updates the per-peer "hasn't stopped changing" watchdog.
+ *
+ * Tracks whether consecutive EVENT_METER_READING values are still changing
+ * (e.g. a water meter still accumulating usage). If the value keeps
+ * changing continuously for WATER_NO_STOP_TIMEOUT_MS without ever holding
+ * steady, the alarm is raised; it clears as soon as one reading repeats the
+ * previous value (flow/activity has stopped). Source-agnostic: works the
+ * same regardless of which node type reported the reading.
+ *
+ * @param[in] peerIdx   Index into peerTable of the reporting peer.
+ * @param[in] newValue  Latest cumulative reading from event_payload_t.value.
+ * @param[in] nowMs     Current millis() timestamp.
+ */
+static void updateValueWatchdog(uint8_t peerIdx, uint32_t newValue, uint32_t nowMs)
+{
+    peer_entry_t *peer = &peerTable[peerIdx];
+
+    if (newValue != peer->lastEventValue)
+    {
+        peer->lastEventValue = newValue;
+
+        if (!peer->valueActive)
+        {
+            peer->valueActive   = 1U;
+            peer->activeSinceMs = nowMs;
+        }
+
+        if (!peer->watchdogAlarmActive &&
+            ((nowMs - peer->activeSinceMs) >= WATER_NO_STOP_TIMEOUT_MS))
+        {
+            peer->watchdogAlarmActive = 1U;
+            gprintf(gDBG,
+                    "[MASTER] ALARM: node=%u value has not stopped changing for %us\r\n",
+                    (uint32_t)peer->nodeId, (uint32_t)(WATER_NO_STOP_TIMEOUT_MS / 1000U));
+            webServerBroadcast(peerTable, peerCount, nowMs);
+            webBroadcastMs = nowMs;
+        }
+    }
+    else if (peer->valueActive)
+    {
+        peer->valueActive = 0U;
+
+        if (peer->watchdogAlarmActive)
+        {
+            peer->watchdogAlarmActive = 0U;
+            gprintf(gDBG, "[MASTER] Alarm cleared: node=%u value stopped changing\r\n",
+                    (uint32_t)peer->nodeId);
+            webServerBroadcast(peerTable, peerCount, nowMs);
+            webBroadcastMs = nowMs;
+        }
+    }
+}
+
+/** ---------------------------------------------------------------------------
+ * @brief Handles a PKT_EVENT received from a slave.
+ *
+ * Unsolicited — not tied to the poll cycle, and dispatched here on the very
+ * next processRxQueue() drain (every loop() iteration) rather than waiting
+ * for the master state machine to reach an idle point. Currently only
+ * EVENT_METER_READING is understood; other event types are logged and
+ * ignored.
+ *
+ * @param[in] srcMac    6-byte ESP-NOW radio source MAC (route address).
+ * @param[in] pkt       Pointer to the fully received packet.
+ */
+static void handleEvent(const uint8_t *srcMac, const espnow_packet_t *pkt)
+{
+    uint8_t peerIdx = findPeer(pkt->header.senderId);
+    if (peerIdx >= MAX_PEERS)
+    {
+        peerIdx = addOrUpdatePeer(srcMac, pkt->header.senderId, pkt->header.nodeType);
+        if (peerIdx >= MAX_PEERS)
+            return; /* Peer table full - nowhere to track this event. */
+    }
+    else
+    {
+        refreshPeerRoute(peerIdx, srcMac, pkt->header.nodeType);
+    }
+
+    event_payload_t evt;
+    unpackEventData(pkt, &evt);
+
+    switch ((event_type_t)evt.eventType)
+    {
+    case EVENT_METER_READING:
+        updateValueWatchdog(peerIdx, evt.value, millis());
+        break;
+
+    default:
+        gprintf(gDBG, "[MASTER] PKT_EVENT from node=%u: unknown eventType=0x%02X\r\n",
+                (uint32_t)pkt->header.senderId, (uint32_t)evt.eventType);
+        break;
+    }
 }
 
 /** ---------------------------------------------------------------------------
@@ -494,6 +631,10 @@ static void processRxQueue(void)
 
         case PKT_POLL_RESP:
             handlePollResp(item.srcMac, &item.pkt);
+            break;
+
+        case PKT_EVENT:
+            handleEvent(item.srcMac, &item.pkt);
             break;
 
         default:

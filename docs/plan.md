@@ -55,23 +55,40 @@ happens over ESP-NOW.
 
 ## 4. Master responsibilities (additions to current firmware)
 
-- Fast-path handling for `PKT_EVENT` in the recv callback.
-- Track `nodeType` per peer so `PKT_CMD` payloads are formatted correctly.
-- Per-meter watchdog state machine: `lastValue`, `lastChangeMs`. On each new
-  reading (arriving over ESP-NOW from the camera via the repeater — see §5/§5a
-  — not MQTT) update `lastValue`/`lastChangeMs`; if
-  `(millis() - lastChangeMs) >= WATER_NO_STOP_TIMEOUT_MS` (a configurable
-  constant, remotely tunable via `PKT_CMD`-style config, not hardcoded), raise
-  an alarm. This state machine is source-agnostic: it works whether the
-  reading came from the camera or a future dedicated `NODE_WATER_METER` pulse
-  counter, both arrive over ESP-NOW.
+- ✅ Fast-path handling for `PKT_EVENT` — implemented 2026-09-12. `PKT_EVENT`
+  is dispatched from `processRxQueue()`, which already runs on every
+  `loop()` iteration regardless of the master's discover/poll state, so an
+  event is never held up waiting for the state machine to reach an idle
+  point.
+- ✅ Track `nodeType` per peer — already done as part of protocol v2.
+- ✅ Per-meter watchdog — implemented 2026-09-12 as `updateValueWatchdog()`.
+  **Correction from an earlier draft of this doc**, which had the logic
+  backwards: the requirement is "alarm if water does **not stop**", i.e. the
+  reading keeps changing continuously for too long — NOT "alarm if the
+  reading stops changing" (that would flag normal idle/no-usage periods).
+  Actual behaviour: each peer tracks `lastEventValue`, `activeSinceMs`
+  (when the value most recently started continuously changing), and
+  `valueActive`. A new `EVENT_METER_READING` (via `PKT_EVENT`,
+  `event_payload_t{eventType, value}`) that differs from `lastEventValue`
+  means the meter is still running; if it's been running continuously since
+  `activeSinceMs` for >= `WATER_NO_STOP_TIMEOUT_MS` (fixed constant, 30 min
+  default — remote tuning via `PKT_CMD` is a possible future enhancement,
+  not built), the alarm is raised. A reading that repeats the previous value
+  means activity has stopped, which clears the alarm and resets the timer.
+  Source-agnostic: works the same regardless of which node type or path
+  (repeater-relayed camera, future `NODE_WATER_METER`, etc.) produced the
+  reading. On raise/clear the master immediately calls
+  `webServerBroadcast()` rather than waiting for the periodic heartbeat, and
+  the peer table JSON now carries an `"alarm"` field (dashboard shows an
+  ALARM status + red row).
 - **Master only** is the network egress point (per user constraint: "only the
   master will have the means to connect to server"). Once Ethernet-equipped
   (§6), the master is an MQTT client connecting to the broker used by
   Node-RED/Home Assistant — publishing peer telemetry/alarms/camera readings
   outward (and potentially subscribing to command topics from HA later, e.g.
   to drive relays). The existing local WS dashboard stays as-is for a browser
-  connecting directly to the master; MQTT is the HA/Node-RED integration path.
+  connecting directly to the master; MQTT is the HA/Node-RED integration path
+  (not yet built — the alarm currently only reaches the local WS dashboard).
 
 ## 5. Camera meter reading — fork jomjol/AI-on-the-edge-device to speak ESP-NOW
 
@@ -160,8 +177,8 @@ second hop, no new bridging protocol required.
 1. ✅ Protocol v2 in `espnow_types.h`: `nodeType`, variable payload, `PKT_CMD` /
    `PKT_EVENT` / `PKT_EVENT_ACK`, protocol version byte. Done 2026-09-12,
    `main.cpp` adapted to match, builds clean (0 warnings).
-2. Master: event fast-path handling + tunable per-meter alarm state machine
-   (§4).
+2. ✅ Master: event fast-path handling + per-meter alarm state machine (§4).
+   Done 2026-09-12, builds clean.
 3. ✅ `ESP_NOW_Slave` (sibling repo, gerrieuae/ESP_NOW_Slave) updated to
    protocol v2 2026-09-12: `nodeType`/`protocolVersion` header fields,
    generic payload via `packSensorData()`, full `pkt_type_t`/`node_type_t`

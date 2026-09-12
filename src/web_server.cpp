@@ -67,6 +67,8 @@ tr.off td{color:#6e7681}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;vertical-align:middle}
 tr.on .dot{background:#3fb950}
 tr.off .dot{background:#6e7681}
+tr.alarm td{color:#f85149}
+tr.alarm .dot{background:#f85149}
 #bar{margin-top:10px;color:#8b949e;font-size:.73em;padding:4px 0}
 .empty{text-align:center;color:#6e7681;padding:22px;font-style:italic}
 @media(max-width:600px){th:nth-child(4),td:nth-child(4),th:nth-child(5),td:nth-child(5){display:none}}
@@ -110,13 +112,14 @@ function connect() {
     } else {
       b.innerHTML = '';
       d.peers.forEach(function (p) {
-        var cls = p.active ? 'on' : 'off';
+        var cls = p.alarm ? 'alarm' : (p.active ? 'on' : 'off');
         var din = '0x' + ('0' + p.din.toString(16).toUpperCase()).slice(-2);
+        var status = p.alarm ? 'ALARM' : (p.active ? 'Online' : 'Offline');
         b.innerHTML +=
           '<tr class="' + cls + '">'
           + '<td><span class="dot"></span>' + p.mac + '</td>'
           + '<td>' + p.id + '</td>'
-          + '<td>' + (p.active ? 'Online' : 'Offline') + '</td>'
+          + '<td>' + status + '</td>'
           + '<td>' + p.ageSec + '</td>'
           + '<td>' + p.analog + '</td>'
           + '<td>' + din + '</td>'
@@ -215,7 +218,8 @@ static uint32_t buildJson(const peer_entry_t *peers,
 
         JSON_APPEND(jsonBuf, pos, JSON_BUF_LEN,
                     "%s{\"mac\":\"%s\",\"id\":%u,\"active\":%u,"
-                    "\"ageSec\":%lu,\"analog\":%u,\"din\":%u,\"uptime\":%lu}",
+                    "\"ageSec\":%lu,\"analog\":%u,\"din\":%u,\"uptime\":%lu,"
+                    "\"alarm\":%u}",
                     (i > 0U) ? "," : "",
                     macStr,
                     (uint32_t)peers[i].nodeId,
@@ -223,7 +227,8 @@ static uint32_t buildJson(const peer_entry_t *peers,
                     ageSec,
                     (uint32_t)peers[i].lastData.analogValue,
                     (uint32_t)peers[i].lastData.digitalInputs,
-                    peers[i].lastData.uptimeSec);
+                    peers[i].lastData.uptimeSec,
+                    (uint32_t)peers[i].watchdogAlarmActive);
     }
 
     JSON_APPEND(jsonBuf, pos, JSON_BUF_LEN, "]}");

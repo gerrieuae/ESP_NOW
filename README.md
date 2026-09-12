@@ -52,8 +52,23 @@ Packet types must stay in sync with any slave/repeater firmware.
 | `PKT_POLL_RESP` | `0x04` | Slave → master | Current sensor data (unicast) |
 | `PKT_CMD` | `0x05` | Master → slave | Generic command (opcode/params in payload) — not yet used by any slave |
 | `PKT_CMD_ACK` | `0x06` | Slave → master | Command acknowledged — not yet used |
-| `PKT_EVENT` | `0x07` | Slave → master | Unsolicited alarm, handled outside the poll cycle — not yet used |
+| `PKT_EVENT` | `0x07` | Slave → master | Unsolicited event, handled immediately (not tied to the poll cycle) |
 | `PKT_EVENT_ACK` | `0x08` | Master → slave | Alarm acknowledged — not yet used |
+
+### Events and the "hasn't stopped" watchdog
+
+`PKT_EVENT` currently carries one event type, `EVENT_METER_READING`
+(`event_payload_t{eventType, value}` — a cumulative reading, e.g. total
+litres or kWh). For each reporting peer the master tracks whether
+consecutive readings keep changing (`updateValueWatchdog()` in `main.cpp`):
+if the value changes continuously for `WATER_NO_STOP_TIMEOUT_MS` (30 min
+default) without ever holding steady, an alarm is raised — e.g. a tap left
+running or a stuck valve. A reading that repeats the previous value means
+activity stopped, clearing the alarm. This is source-agnostic: it works the
+same whether the reading came directly over ESP-NOW or via a repeater. On
+raise/clear the master immediately broadcasts the updated peer table over
+the WS dashboard (`"alarm"` field per peer) rather than waiting for the next
+periodic heartbeat.
 
 The header carries `protocolVersion` (currently `2`) and `nodeType` — see
 `node_type_t` in `espnow_types.h` for the current node taxonomy (`RELAY`,
