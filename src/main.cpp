@@ -174,11 +174,12 @@ static void     masterProcess       (void);
 static void     processRxQueue      (void);
 static void     handleDiscoverResp  (const uint8_t *srcMac, const espnow_packet_t *pkt);
 static void     handlePollResp      (const uint8_t *srcMac, const espnow_packet_t *pkt);
-static uint8_t  findPeer            (const uint8_t *macAddr);
-static uint8_t  addOrUpdatePeer     (const uint8_t *macAddr, uint8_t nodeId);
+static uint8_t  findPeer            (uint8_t nodeId);
+static uint8_t  addOrUpdatePeer     (const uint8_t *macAddr, uint8_t nodeId, uint8_t nodeType);
 static void     registerEspNowPeer  (const uint8_t *macAddr);
 static void     evictStalePeers     (void);
 static void     sendPacket          (const uint8_t *destMac, pkt_type_t pktType);
+static void     unpackSensorData    (const espnow_packet_t *pkt, sensor_data_t *data);
 static uint8_t  countActivePeers    (void);
 static uint8_t  findNextActivePeer  (uint8_t startIdx);
 static bool     initEspNowMaster    (void);
@@ -241,15 +242,21 @@ static void onDataRecv(const uint8_t *srcMac,
 // ============================================================================
 
 /** ---------------------------------------------------------------------------
- * @brief Searches peerTable for an entry with a matching MAC address.
- * @param[in] macAddr   6-byte MAC address to find.
+ * @brief Searches peerTable for an entry with a matching logical node ID.
+ *
+ * Identity is keyed by nodeId (the sender's header.senderId), not by radio
+ * MAC address: a peer reached through a repeater arrives with the
+ * repeater's MAC as the ESP-NOW radio source, so the MAC alone cannot
+ * identify the originating peer.
+ *
+ * @param[in] nodeId    Logical node identifier to find (pkt_header_t.senderId).
  * @return              Index in peerTable on success, MAX_PEERS if not found.
  */
-static uint8_t findPeer(const uint8_t *macAddr)
+static uint8_t findPeer(uint8_t nodeId)
 {
     for (uint8_t i = 0U; i < peerCount; i++)
     {
-        if (memcmp(peerTable[i].macAddr, macAddr, MAC_ADDR_LEN) == 0)
+        if (peerTable[i].nodeId == nodeId)
             return i;
     }
     return MAX_PEERS;
@@ -258,22 +265,30 @@ static uint8_t findPeer(const uint8_t *macAddr)
 /** ---------------------------------------------------------------------------
  * @brief Adds a new peer to peerTable, or returns the index of an existing one.
  *
- * If the MAC is already in the table the existing entry is reactivated and its
- * nodeId is updated.  If the table is full MAX_PEERS is returned and the peer
- * is not added.
+ * Peers are identified by nodeId, not by MAC address. macAddr is the "route"
+ * address the master should transmit to in order to reach this peer: the
+ * peer's own MAC for a directly-reachable node, or a repeater's MAC when the
+ * peer is only reachable through a relay. The route is refreshed on every
+ * call (including for an already-known peer) since it can change, e.g. if a
+ * repeater takes over relaying for a peer that was previously direct.
  *
- * @param[in] macAddr   Peer's 6-byte MAC address.
- * @param[in] nodeId    Peer's self-reported node identifier.
+ * If the table is full MAX_PEERS is returned and the peer is not added.
+ *
+ * @param[in] macAddr   Route MAC address to use when sending to this peer.
+ * @param[in] nodeId    Peer's logical node identifier (pkt_header_t.senderId).
+ * @param[in] nodeType  Peer's self-reported role (node_type_t).
  * @return              Index in peerTable, or MAX_PEERS if the table is full.
  */
-static uint8_t addOrUpdatePeer(const uint8_t *macAddr, uint8_t nodeId)
+static uint8_t addOrUpdatePeer(const uint8_t *macAddr, uint8_t nodeId, uint8_t nodeType)
 {
-    uint8_t existingIdx = findPeer(macAddr);
+    uint8_t existingIdx = findPeer(nodeId);
     if (existingIdx < MAX_PEERS)
     {
-        peerTable[existingIdx].nodeId    = nodeId;
-        peerTable[existingIdx].isActive  = 1U;
+        memcpy(peerTable[existingIdx].macAddr, macAddr, MAC_ADDR_LEN);
+        peerTable[existingIdx].nodeType   = nodeType;
+        peerTable[existingIdx].isActive   = 1U;
         peerTable[existingIdx].lastSeenMs = millis();
+        registerEspNowPeer(macAddr);
         return existingIdx;
     }
 
@@ -286,6 +301,7 @@ static uint8_t addOrUpdatePeer(const uint8_t *macAddr, uint8_t nodeId)
     uint8_t newIdx = peerCount;
     memcpy(peerTable[newIdx].macAddr, macAddr, MAC_ADDR_LEN);
     peerTable[newIdx].nodeId      = nodeId;
+    peerTable[newIdx].nodeType    = nodeType;
     peerTable[newIdx].lastSeenMs  = millis();
     peerTable[newIdx].isActive    = 1U;
     memset(&peerTable[newIdx].lastData, 0, sizeof(sensor_data_t));
@@ -353,8 +369,8 @@ static void evictStalePeers(void)
 /** ---------------------------------------------------------------------------
  * @brief Constructs and sends a typed ESP-NOW packet to the given destination.
  *
- * The data fields are zeroed; this is appropriate for PKT_DISCOVER and
- * PKT_POLL where no sensor payload is carried by the master.
+ * The payload is left empty (payloadLen = 0); this is appropriate for
+ * PKT_DISCOVER and PKT_POLL where no sensor payload is carried by the master.
  *
  * @param[in] destMac   6-byte destination MAC address.
  * @param[in] pktType   Protocol packet type (pkt_type_t).
@@ -363,9 +379,12 @@ static void sendPacket(const uint8_t *destMac, pkt_type_t pktType)
 {
     espnow_packet_t outPkt;
     memset(&outPkt, 0, sizeof(outPkt));
-    outPkt.header.pktType     = (uint8_t)pktType;
-    outPkt.header.senderId    = MASTER_NODE_ID;
-    outPkt.header.timestampMs = millis();
+    outPkt.header.pktType         = (uint8_t)pktType;
+    outPkt.header.protocolVersion = PROTOCOL_VERSION;
+    outPkt.header.nodeType        = (uint8_t)NODE_TYPE_MASTER;
+    outPkt.header.senderId        = MASTER_NODE_ID;
+    outPkt.header.timestampMs     = millis();
+    outPkt.payloadLen             = 0U;
 
     esp_err_t result = esp_now_send(destMac,
                                     (const uint8_t *)&outPkt,
@@ -377,52 +396,80 @@ static void sendPacket(const uint8_t *destMac, pkt_type_t pktType)
 }
 
 /** ---------------------------------------------------------------------------
+ * @brief Unpacks a sensor_data_t out of a received packet's payload buffer.
+ * @param[in]  pkt   Received packet whose payload holds a sensor_data_t.
+ * @param[out] data  Destination sensor snapshot.
+ */
+static void unpackSensorData(const espnow_packet_t *pkt, sensor_data_t *data)
+{
+    if (pkt->payloadLen < (uint8_t)sizeof(sensor_data_t))
+    {
+        memset(data, 0, sizeof(sensor_data_t));
+        return;
+    }
+    memcpy(data, pkt->payload, sizeof(sensor_data_t));
+}
+
+/** ---------------------------------------------------------------------------
  * @brief Handles a PKT_DISCOVER_RESP received from a slave.
  *
  * Adds the slave to the peer table (or updates it if already known) and
- * stores the initial sensor snapshot that arrived with the response.
+ * stores the initial sensor snapshot that arrived with the response. Peer
+ * identity is the packet's header.senderId, not the ESP-NOW radio source
+ * MAC — srcMac is only used as the route address (see addOrUpdatePeer) since
+ * a relayed peer's radio source is its repeater, not itself.
  *
- * @param[in] srcMac    6-byte source MAC of the responding slave.
+ * @param[in] srcMac    6-byte ESP-NOW radio source MAC (route address).
  * @param[in] pkt       Pointer to the fully received packet.
  */
 static void handleDiscoverResp(const uint8_t *srcMac, const espnow_packet_t *pkt)
 {
-    uint8_t peerIdx = addOrUpdatePeer(srcMac, pkt->data.nodeId);
+    sensor_data_t data;
+    unpackSensorData(pkt, &data);
+
+    uint8_t peerIdx = addOrUpdatePeer(srcMac, pkt->header.senderId, pkt->header.nodeType);
     if (peerIdx < MAX_PEERS)
     {
-        memcpy(&peerTable[peerIdx].lastData, &pkt->data, sizeof(sensor_data_t));
+        memcpy(&peerTable[peerIdx].lastData, &data, sizeof(sensor_data_t));
     }
 }
 
 /** ---------------------------------------------------------------------------
  * @brief Handles a PKT_POLL_RESP received from a known slave.
  *
- * Updates the peer's lastSeenMs timestamp and sensor data snapshot.
- * If the source MAC is unknown the frame is treated as an implicit
- * discovery response.
+ * Updates the peer's route MAC, lastSeenMs timestamp, and sensor data
+ * snapshot. Peer identity is the packet's header.senderId, not the ESP-NOW
+ * radio source MAC (see addOrUpdatePeer). If the senderId is unknown the
+ * frame is treated as an implicit discovery response.
  *
- * @param[in] srcMac    6-byte source MAC of the responding slave.
+ * @param[in] srcMac    6-byte ESP-NOW radio source MAC (route address).
  * @param[in] pkt       Pointer to the fully received packet.
  */
 static void handlePollResp(const uint8_t *srcMac, const espnow_packet_t *pkt)
 {
-    uint8_t peerIdx = findPeer(srcMac);
+    uint8_t peerIdx = findPeer(pkt->header.senderId);
     if (peerIdx >= MAX_PEERS)
     {
         handleDiscoverResp(srcMac, pkt);
         return;
     }
 
+    sensor_data_t data;
+    unpackSensorData(pkt, &data);
+
+    memcpy(peerTable[peerIdx].macAddr, srcMac, MAC_ADDR_LEN);
+    registerEspNowPeer(srcMac);
     peerTable[peerIdx].lastSeenMs = millis();
     peerTable[peerIdx].isActive   = 1U;
-    memcpy(&peerTable[peerIdx].lastData, &pkt->data, sizeof(sensor_data_t));
+    peerTable[peerIdx].nodeType   = pkt->header.nodeType;
+    memcpy(&peerTable[peerIdx].lastData, &data, sizeof(sensor_data_t));
 
     gprintf(gDBG,
             "[MASTER] node=%u  analog=%u  din=0x%02X  uptime=%us\r\n",
-            (uint32_t)pkt->data.nodeId,
-            (uint32_t)pkt->data.analogValue,
-            (uint32_t)pkt->data.digitalInputs,
-            pkt->data.uptimeSec);
+            (uint32_t)data.nodeId,
+            (uint32_t)data.analogValue,
+            (uint32_t)data.digitalInputs,
+            data.uptimeSec);
 }
 
 /** ---------------------------------------------------------------------------

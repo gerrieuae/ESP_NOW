@@ -36,9 +36,13 @@ AsyncTCP           https://github.com/me-no-dev/AsyncTCP.git
 
 Installed automatically by PlatformIO via `platformio.ini`.
 
-## Protocol
+## Protocol (v2)
 
-All packets share the same 13-byte `espnow_packet_t` wire format (header + sensor payload). Packet types must stay in sync with the slave firmware.
+Every packet is an `espnow_packet_t`: a fixed header followed by a small
+generic payload (`payloadLen` + up to `MAX_PAYLOAD_LEN` = 32 bytes), well
+under the ~250-byte ESP-NOW frame limit (enforced by a compile-time
+`static_assert`). Payload contents are interpreted per `pktType`/`nodeType`.
+Packet types must stay in sync with any slave/repeater firmware.
 
 | Type | Value | Direction | Description |
 |------|-------|-----------|-------------|
@@ -46,8 +50,33 @@ All packets share the same 13-byte `espnow_packet_t` wire format (header + senso
 | `PKT_DISCOVER_RESP` | `0x02` | Slave → master | Slave identification + initial sensor data |
 | `PKT_POLL` | `0x03` | Master → slave | Request latest sensor data (unicast) |
 | `PKT_POLL_RESP` | `0x04` | Slave → master | Current sensor data (unicast) |
+| `PKT_CMD` | `0x05` | Master → slave | Generic command (opcode/params in payload) — not yet used by any slave |
+| `PKT_CMD_ACK` | `0x06` | Slave → master | Command acknowledged — not yet used |
+| `PKT_EVENT` | `0x07` | Slave → master | Unsolicited alarm, handled outside the poll cycle — not yet used |
+| `PKT_EVENT_ACK` | `0x08` | Master → slave | Alarm acknowledged — not yet used |
 
-> **Sensor payload** (`sensor_data_t`) is a placeholder. Replace `analogValue`, `digitalInputs`, and `uptimeSec` fields in `espnow_types.h` to match the actual hardware — any change must be mirrored in the slave project.
+The header carries `protocolVersion` (currently `2`) and `nodeType` — see
+`node_type_t` in `espnow_types.h` for the current node taxonomy (`RELAY`,
+`DISCRETE_INPUT`, `WATER_METER`, `BOREHOLE_CTRL`, `GATEWAY`, plus `MASTER`).
+
+**Peer identity is `nodeId` (`header.senderId`), not MAC address.**
+`peer_entry_t.macAddr` is the *route* to a peer — the peer's own MAC when
+directly reachable, or a repeater's MAC when it isn't — and is refreshed on
+every packet received from that peer. This is what lets a peer be relayed
+through an [ESP_NOW_Repeater](https://github.com/gerrieuae/ESP_NOW_Repeater)
+node transparently, with no special-case code in the master.
+
+> **Sensor payload** (`sensor_data_t`) is still a placeholder, packed/unpacked
+> into the generic payload buffer via `unpackSensorData()`. Replace
+> `analogValue`, `digitalInputs`, and `uptimeSec` fields in `espnow_types.h`
+> to match the actual hardware — any change must be mirrored in any slave
+> firmware that talks to this master.
+
+[ESP_NOW_Slave](https://github.com/gerrieuae/ESP_NOW_Slave) has been updated
+to match this protocol v2 wire format.
+
+See [`docs/plan.md`](docs/plan.md) for the full mesh expansion plan (camera
+meter reading, repeater, Ethernet/MQTT gateway, Home Assistant integration).
 
 ## Key Configuration
 
@@ -77,5 +106,12 @@ ESP_NOW/
 │   ├── web_server.h      # Web server API
 │   ├── hardware.h        # Board pin / peripheral definitions
 │   └── gprintf/          # Debug UART printf library
+├── docs/
+│   └── plan.md           # Mesh expansion plan (camera, repeater, gateway, HA)
 └── platformio.ini
 ```
+
+## Related
+
+- **Slave firmware**: [ESP_NOW_Slave](https://github.com/gerrieuae/ESP_NOW_Slave) — sensor node responding to discovery/poll
+- **Repeater firmware**: [ESP_NOW_Repeater](https://github.com/gerrieuae/ESP_NOW_Repeater) — fixed one-hop relay for slaves out of direct radio range
